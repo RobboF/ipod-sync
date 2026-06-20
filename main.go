@@ -186,7 +186,8 @@ func syncRenamed(src, dst string) (SyncStats, error) {
 			return nil
 		}
 		rel, _ := filepath.Rel(src, path)
-		destPath := filepath.Join(dst, sanitizeRelPath(rel))
+		sanitizedRel := sanitizeRelPath(rel)
+		destPath := filepath.Join(dst, sanitizedRel)
 		expectedDst[destPath] = true
 
 		if info.IsDir() {
@@ -209,9 +210,13 @@ func syncRenamed(src, dst string) (SyncStats, error) {
 		if needsCopy {
 			if err := copyFile(path, destPath, info); err != nil {
 				fmt.Fprintf(os.Stderr, "copy %s: %v\n", path, err)
+				fmt.Printf("  error    %s\n", sanitizedRel)
 				return nil
 			}
 			stats.Copied++
+			fmt.Printf("  updated  %s\n", sanitizedRel)
+		} else {
+			fmt.Printf("  skipped  %s\n", sanitizedRel)
 		}
 		return nil
 	}); err != nil {
@@ -234,10 +239,12 @@ func syncRenamed(src, dst string) (SyncStats, error) {
 			continue
 		}
 		if !expectedDst[path] {
+			rel, _ := filepath.Rel(dst, path)
 			if err := os.RemoveAll(path); err != nil {
 				fmt.Fprintf(os.Stderr, "delete %s: %v\n", path, err)
 			} else {
 				stats.Deleted++
+				fmt.Printf("  deleted  %s\n", rel)
 			}
 		}
 	}
