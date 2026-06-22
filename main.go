@@ -100,21 +100,29 @@ func walkFollowSymlinks(root string, fn func(path string, info os.FileInfo) erro
 }
 
 func findBlockDevice(usbSysPath string) (string, error) {
-	var blockDir string
+	var candidates []string
 	walkFollowSymlinks(usbSysPath, func(path string, info os.FileInfo) error {
-		if info.IsDir() && info.Name() == "block" && blockDir == "" {
-			blockDir = path
+		if !info.IsDir() || info.Name() != "block" {
+			return nil
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return nil
+		}
+		for _, e := range entries {
+			candidates = append(candidates, e.Name())
 		}
 		return nil
 	})
-	if blockDir == "" {
-		return "", fmt.Errorf("no block device found under %s", usbSysPath)
+	for _, name := range candidates {
+		if !strings.HasPrefix(name, "sr") {
+			return name, nil
+		}
 	}
-	entries, err := os.ReadDir(blockDir)
-	if err != nil || len(entries) == 0 {
-		return "", fmt.Errorf("no entries in block dir %s", blockDir)
+	if len(candidates) > 0 {
+		return candidates[0], nil
 	}
-	return entries[0].Name(), nil
+	return "", fmt.Errorf("no block device found under %s", usbSysPath)
 }
 
 // sanitizeName applies FAT-safe renaming: colon → " - ", forbidden chars → "_".
