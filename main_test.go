@@ -1,11 +1,15 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -506,5 +510,263 @@ func TestNotify_ServerError(t *testing.T) {
 	err := notify(srv.URL, "title", "body")
 	if err == nil {
 		t.Error("expected error for 5xx response, got nil")
+	}
+}
+
+// ---- parseBmarks / writeBmarks ----
+
+func TestParseBmarks(t *testing.T) {
+	line := ">3;0;51589249;0;3285879;0;0;10000;10000;/<HDD0>/Audiobooks/Andy Weir/The Martian/;The Martian.m4b\n"
+	f := filepath.Join(t.TempDir(), "test.bmark")
+	os.WriteFile(f, []byte(line), 0o644)
+
+	marks, err := parseBmarks(f)
+	if err != nil {
+		t.Fatalf("parseBmarks: %v", err)
+	}
+	if len(marks) != 1 {
+		t.Fatalf("len = %d, want 1", len(marks))
+	}
+	m := marks[0]
+	if m.ByteOffset != 51589249 {
+		t.Errorf("ByteOffset = %d, want 51589249", m.ByteOffset)
+	}
+	if m.TimeMs != 3285879 {
+		t.Errorf("TimeMs = %d, want 3285879", m.TimeMs)
+	}
+	if m.Dir != "/<HDD0>/Audiobooks/Andy Weir/The Martian/" {
+		t.Errorf("Dir = %q", m.Dir)
+	}
+	if m.Filename != "The Martian.m4b" {
+		t.Errorf("Filename = %q", m.Filename)
+	}
+}
+
+func TestParseBmarks_MultipleEntries(t *testing.T) {
+	content := ">3;0;51589249;0;3285879;0;0;10000;10000;/<HDD0>/Audiobooks/A/B/;B.m4b\n" +
+		">3;0;7723765;0;491612;0;0;10000;10000;/<HDD0>/Audiobooks/A/B/;B.m4b\n"
+	f := filepath.Join(t.TempDir(), "multi.bmark")
+	os.WriteFile(f, []byte(content), 0o644)
+
+	marks, err := parseBmarks(f)
+	if err != nil {
+		t.Fatalf("parseBmarks: %v", err)
+	}
+	if len(marks) != 2 {
+		t.Fatalf("len = %d, want 2", len(marks))
+	}
+	if marks[1].TimeMs != 491612 {
+		t.Errorf("marks[1].TimeMs = %d, want 491612", marks[1].TimeMs)
+	}
+}
+
+func TestWriteBmarks_RoundTrip(t *testing.T) {
+	want := []bmark{
+		{ByteOffset: 51589249, TimeMs: 3285879, Dir: "/<HDD0>/Audiobooks/A/B/", Filename: "B.m4b"},
+	}
+	f := filepath.Join(t.TempDir(), "out.bmark")
+	if err := writeBmarks(f, want); err != nil {
+		t.Fatalf("writeBmarks: %v", err)
+	}
+	got, err := parseBmarks(f)
+	if err != nil {
+		t.Fatalf("parseBmarks: %v", err)
+	}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Errorf("round-trip mismatch: got %+v, want %+v", got, want)
+	}
+}
+
+// ---- syncProgress ----
+
+// absMockServer builds a test HTTP server that handles the four ABS endpoints.
+// patchedTime is set to the currentTime value received in a PATCH request.
+func absMockServer(t *testing.T, absProgressSeconds float64, patchedTime *float64) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		enc := json.NewEncoder(w)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/libraries":
+			enc.Encode(map[string]interface{}{
+				"libraries": []map[string]interface{}{
+					{"id": "lib1", "mediaType": "book"},
+				},
+			})
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/libraries/lib1/items"):
+			enc.Encode(map[string]interface{}{
+				"results": []map[string]interface{}{
+					{"id": "item1", "relPath": "Andy Weir/The Martian", "media": map[string]interface{}{"duration": 40000.0}},
+				},
+			})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/item1"):
+			if absProgressSeconds < 0 {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			enc.Encode(map[string]interface{}{"currentTime": absProgressSeconds, "isFinished": false})
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/item1"):
+			var body map[string]interface{}
+			json.NewDecoder(r.Body).Decode(&body)
+			if patchedTime != nil {
+				*patchedTime = body["currentTime"].(float64)
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/me/items-in-progress":
+			enc.Encode(map[string]interface{}{"libraryItems": []interface{}{}})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+}
+
+func writeSampleBmark(t *testing.T, dst, relPath string, timeMs, byteOffset int64) string {
+	t.Helper()
+	dir := filepath.Join(dst, filepath.Dir(relPath))
+	os.MkdirAll(dir, 0o755)
+	bmarkPath := filepath.Join(dst, relPath+".bmark")
+	iPodDir := "/<HDD0>/Audiobooks/" + strings.ReplaceAll(relPath, string(os.PathSeparator), "/") + "/"
+	os.WriteFile(bmarkPath, []byte(
+		">3;0;"+strconv.FormatInt(byteOffset, 10)+";0;"+strconv.FormatInt(timeMs, 10)+";0;0;10000;10000;"+iPodDir+";The Martian.m4b\n",
+	), 0o644)
+	return bmarkPath
+}
+
+func TestSyncProgress_iPodAhead(t *testing.T) {
+	var patched float64
+	srv := absMockServer(t, 1000.0, &patched) // ABS at 1000s
+	defer srv.Close()
+
+	dst := t.TempDir()
+	writeSampleBmark(t, dst, "Andy Weir/The Martian", 3285879, 51589249) // iPod at ~3285s
+
+	stats, err := syncProgress(srv.URL, "tok", dst)
+	if err != nil {
+		t.Fatalf("syncProgress: %v", err)
+	}
+	if stats.IPodToABS != 1 {
+		t.Errorf("IPodToABS = %d, want 1", stats.IPodToABS)
+	}
+	wantTime := 3285.879
+	if math.Abs(patched-wantTime) > 0.01 {
+		t.Errorf("patched currentTime = %v, want ~%v", patched, wantTime)
+	}
+}
+
+func TestSyncProgress_ABSAhead(t *testing.T) {
+	srv := absMockServer(t, 5000.0, nil) // ABS at 5000s
+	defer srv.Close()
+
+	dst := t.TempDir()
+	bmarkPath := writeSampleBmark(t, dst, "Andy Weir/The Martian", 3285879, 51589249) // iPod at ~3285s
+
+	stats, err := syncProgress(srv.URL, "tok", dst)
+	if err != nil {
+		t.Fatalf("syncProgress: %v", err)
+	}
+	if stats.ABSToIPod != 1 {
+		t.Errorf("ABSToIPod = %d, want 1", stats.ABSToIPod)
+	}
+
+	marks, _ := parseBmarks(bmarkPath)
+	if len(marks) == 0 {
+		t.Fatal("bmark missing after update")
+	}
+	if marks[0].TimeMs != 5000000 {
+		t.Errorf("updated TimeMs = %d, want 5000000", marks[0].TimeMs)
+	}
+}
+
+func TestSyncProgress_InSync(t *testing.T) {
+	srv := absMockServer(t, 3285.0, nil) // ABS at 3285s, iPod at ~3285s — within 5s threshold
+	defer srv.Close()
+
+	dst := t.TempDir()
+	writeSampleBmark(t, dst, "Andy Weir/The Martian", 3285879, 51589249)
+
+	stats, err := syncProgress(srv.URL, "tok", dst)
+	if err != nil {
+		t.Fatalf("syncProgress: %v", err)
+	}
+	if stats.InSync != 1 || stats.IPodToABS != 0 || stats.ABSToIPod != 0 {
+		t.Errorf("stats = %+v, want InSync=1", stats)
+	}
+}
+
+func TestSyncProgress_NoABSProgress(t *testing.T) {
+	var patched float64
+	srv := absMockServer(t, -1, &patched) // ABS returns 404 (no progress)
+	defer srv.Close()
+
+	dst := t.TempDir()
+	writeSampleBmark(t, dst, "Andy Weir/The Martian", 3285879, 51589249)
+
+	stats, err := syncProgress(srv.URL, "tok", dst)
+	if err != nil {
+		t.Fatalf("syncProgress: %v", err)
+	}
+	// iPod has progress, ABS has none → iPod should win
+	if stats.IPodToABS != 1 {
+		t.Errorf("IPodToABS = %d, want 1", stats.IPodToABS)
+	}
+}
+
+func TestSyncProgress_CreatesNewBmark(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		enc := json.NewEncoder(w)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/libraries":
+			enc.Encode(map[string]interface{}{
+				"libraries": []map[string]interface{}{{"id": "lib1", "mediaType": "book"}},
+			})
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/libraries/lib1/items"):
+			enc.Encode(map[string]interface{}{
+				"results": []map[string]interface{}{
+					{"id": "item1", "relPath": "Andy Weir/Project Hail Mary", "media": map[string]interface{}{"duration": 36000.0}},
+				},
+			})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/item1"):
+			w.WriteHeader(http.StatusNotFound) // progress endpoint not called for new bmarks
+		case r.Method == http.MethodGet && r.URL.Path == "/api/me/items-in-progress":
+			enc.Encode(map[string]interface{}{
+				"libraryItems": []map[string]interface{}{
+					{"id": "item1", "userMediaProgress": map[string]interface{}{
+						"currentTime": 1800.0, "isFinished": false,
+					}},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	dst := t.TempDir()
+	// Create book folder with an m4b file (but no bmark)
+	bookDir := filepath.Join(dst, "Andy Weir", "Project Hail Mary")
+	os.MkdirAll(bookDir, 0o755)
+	// Simulate a 72 MB file (36000s at ~16 bytes/ms)
+	f, _ := os.Create(filepath.Join(bookDir, "Project Hail Mary.m4b"))
+	f.Truncate(72 * 1024 * 1024)
+	f.Close()
+
+	stats, err := syncProgress(srv.URL, "tok", dst)
+	if err != nil {
+		t.Fatalf("syncProgress: %v", err)
+	}
+	if stats.Created != 1 {
+		t.Errorf("Created = %d, want 1", stats.Created)
+	}
+
+	bmarkPath := filepath.Join(dst, "Andy Weir", "Project Hail Mary.bmark")
+	marks, err := parseBmarks(bmarkPath)
+	if err != nil || len(marks) == 0 {
+		t.Fatalf("bmark not created: %v", err)
+	}
+	if marks[0].TimeMs != 1800000 {
+		t.Errorf("TimeMs = %d, want 1800000", marks[0].TimeMs)
+	}
+	if !strings.Contains(marks[0].Dir, "Project Hail Mary") {
+		t.Errorf("Dir = %q, expected book path", marks[0].Dir)
 	}
 }

@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -18,6 +21,7 @@ const (
 	iPodProductID = "1261"
 	mountPoint    = "/mnt/ipod"
 	ntfyURL       = "http://ntfy.ntfy.svc.cluster.local/ipod"
+	absURL        = "http://audiobookshelf.arr.svc.cluster.local"
 )
 
 func findIPod(basePath string) (string, error) {
@@ -141,6 +145,303 @@ type SyncStats struct {
 	Copied  int
 	Deleted int
 	Total   int
+}
+
+type ProgressStats struct {
+	IPodToABS int
+	ABSToIPod int
+	Created   int
+	InSync    int
+}
+
+type bmark struct {
+	ByteOffset int64
+	TimeMs     int64
+	Dir        string
+	Filename   string
+}
+
+var errNotFound = errors.New("not found")
+
+func parseBmarks(path string) ([]bmark, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var marks []bmark
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimRight(line, "\r")
+		if line == "" {
+			continue
+		}
+		// Format: >3;0;<byte_offset>;0;<time_ms>;0;0;10000;10000;<dir>;<filename>
+		parts := strings.SplitN(line, ";", 11)
+		if len(parts) < 11 {
+			continue
+		}
+		byteOffset, _ := strconv.ParseInt(parts[2], 10, 64)
+		timeMs, _ := strconv.ParseInt(parts[4], 10, 64)
+		marks = append(marks, bmark{
+			ByteOffset: byteOffset,
+			TimeMs:     timeMs,
+			Dir:        parts[9],
+			Filename:   parts[10],
+		})
+	}
+	return marks, nil
+}
+
+func writeBmarks(path string, marks []bmark) error {
+	var sb strings.Builder
+	for _, m := range marks {
+		fmt.Fprintf(&sb, ">3;0;%d;0;%d;0;0;10000;10000;%s;%s\n",
+			m.ByteOffset, m.TimeMs, m.Dir, m.Filename)
+	}
+	return os.WriteFile(path, []byte(sb.String()), 0o644)
+}
+
+func absDoRequest(method, token, url string, body, out interface{}) error {
+	var bodyReader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		bodyReader = bytes.NewReader(data)
+	}
+	req, err := http.NewRequest(method, url, bodyReader)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return errNotFound
+	}
+	if resp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return fmt.Errorf("%s %s: status %d", method, url, resp.StatusCode)
+	}
+	if out != nil {
+		return json.NewDecoder(resp.Body).Decode(out)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+func syncProgress(absBase, token, audiobooksDst string) (ProgressStats, error) {
+	var stats ProgressStats
+
+	var libResp struct {
+		Libraries []struct {
+			ID        string `json:"id"`
+			MediaType string `json:"mediaType"`
+		} `json:"libraries"`
+	}
+	if err := absDoRequest(http.MethodGet, token, absBase+"/api/libraries", nil, &libResp); err != nil {
+		return stats, fmt.Errorf("list libraries: %w", err)
+	}
+	var libID string
+	for _, l := range libResp.Libraries {
+		if l.MediaType == "book" {
+			libID = l.ID
+			break
+		}
+	}
+	if libID == "" {
+		return stats, fmt.Errorf("no audiobook library found")
+	}
+
+	var itemsResp struct {
+		Results []struct {
+			ID    string `json:"id"`
+			RelPath string `json:"relPath"`
+			Media struct {
+				Duration float64 `json:"duration"`
+			} `json:"media"`
+		} `json:"results"`
+	}
+	if err := absDoRequest(http.MethodGet, token, absBase+"/api/libraries/"+libID+"/items?limit=10000", nil, &itemsResp); err != nil {
+		return stats, fmt.Errorf("list items: %w", err)
+	}
+
+	type absItem struct {
+		id       string
+		relPath  string
+		duration float64
+	}
+	itemByPath := make(map[string]absItem)
+	itemByID := make(map[string]absItem)
+	for _, it := range itemsResp.Results {
+		key := sanitizeRelPath(it.RelPath)
+		ai := absItem{id: it.ID, relPath: key, duration: it.Media.Duration}
+		itemByPath[key] = ai
+		itemByID[it.ID] = ai
+	}
+
+	const syncThresholdMs = int64(5000)
+	hddID := "<HDD0>"
+	bmarkPaths := make(map[string]bool)
+
+	if err := filepath.Walk(audiobooksDst, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".bmark") {
+			return nil
+		}
+		rel, _ := filepath.Rel(audiobooksDst, path)
+		relNoExt := strings.TrimSuffix(rel, ".bmark")
+		bmarkPaths[relNoExt] = true
+
+		ai, ok := itemByPath[relNoExt]
+		if !ok {
+			fmt.Printf("  no match  %s\n", relNoExt)
+			return nil
+		}
+
+		marks, err := parseBmarks(path)
+		if err != nil || len(marks) == 0 {
+			return nil
+		}
+		iPodMs := marks[0].TimeMs
+
+		// Derive HDD identifier from existing bmarks (e.g. <HDD0>).
+		if dir := marks[0].Dir; strings.HasPrefix(dir, "/") {
+			if parts := strings.SplitN(dir, "/", 3); len(parts) >= 2 && parts[1] != "" {
+				hddID = parts[1]
+			}
+		}
+
+		var prog struct {
+			CurrentTime float64 `json:"currentTime"`
+			IsFinished  bool    `json:"isFinished"`
+		}
+		err = absDoRequest(http.MethodGet, token, absBase+"/api/me/progress/"+ai.id, nil, &prog)
+		if err != nil && !errors.Is(err, errNotFound) {
+			fmt.Fprintf(os.Stderr, "  progress %s: %v\n", relNoExt, err)
+			return nil
+		}
+		absMs := int64(prog.CurrentTime * 1000)
+
+		diff := iPodMs - absMs
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff <= syncThresholdMs {
+			stats.InSync++
+			fmt.Printf("  in sync   %s\n", relNoExt)
+			return nil
+		}
+
+		if iPodMs > absMs {
+			fmt.Printf("  iPod→ABS  %s (%.0fs→%.0fs)\n", relNoExt, float64(absMs)/1000, float64(iPodMs)/1000)
+			if err := absDoRequest(http.MethodPatch, token, absBase+"/api/me/progress/"+ai.id, map[string]interface{}{
+				"currentTime": float64(iPodMs) / 1000,
+				"isFinished":  false,
+			}, nil); err != nil {
+				fmt.Fprintf(os.Stderr, "  update ABS %s: %v\n", relNoExt, err)
+				return nil
+			}
+			stats.IPodToABS++
+			return nil
+		}
+
+		// ABS is ahead: rewrite bmark using existing bytes-per-ms ratio.
+		fmt.Printf("  ABS→iPod  %s (%.0fs→%.0fs)\n", relNoExt, float64(iPodMs)/1000, float64(absMs)/1000)
+		var bytesPerMs float64
+		if marks[0].TimeMs > 0 {
+			bytesPerMs = float64(marks[0].ByteOffset) / float64(marks[0].TimeMs)
+		}
+		updated := marks[0]
+		updated.TimeMs = absMs
+		updated.ByteOffset = int64(float64(absMs) * bytesPerMs)
+		if err := writeBmarks(path, []bmark{updated}); err != nil {
+			fmt.Fprintf(os.Stderr, "  write bmark %s: %v\n", relNoExt, err)
+			return nil
+		}
+		stats.ABSToIPod++
+		return nil
+	}); err != nil {
+		return stats, err
+	}
+
+	// Create bmarks for ABS in-progress books that have no bmark on the iPod yet.
+	var inProg struct {
+		LibraryItems []struct {
+			ID                string `json:"id"`
+			UserMediaProgress struct {
+				CurrentTime float64 `json:"currentTime"`
+				IsFinished  bool    `json:"isFinished"`
+			} `json:"userMediaProgress"`
+		} `json:"libraryItems"`
+	}
+	if err := absDoRequest(http.MethodGet, token, absBase+"/api/me/items-in-progress", nil, &inProg); err != nil {
+		fmt.Fprintf(os.Stderr, "  items-in-progress: %v\n", err)
+		return stats, nil
+	}
+
+	for _, item := range inProg.LibraryItems {
+		if item.UserMediaProgress.IsFinished {
+			continue
+		}
+		ai, ok := itemByID[item.ID]
+		if !ok || bmarkPaths[ai.relPath] {
+			continue
+		}
+		absMs := int64(item.UserMediaProgress.CurrentTime * 1000)
+		if absMs == 0 {
+			continue
+		}
+
+		bookDir := filepath.Join(audiobooksDst, filepath.FromSlash(ai.relPath))
+		if _, err := os.Stat(bookDir); os.IsNotExist(err) {
+			continue
+		}
+		entries, err := os.ReadDir(bookDir)
+		if err != nil {
+			continue
+		}
+		var m4bName string
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".m4b") {
+				m4bName = e.Name()
+				break
+			}
+		}
+		if m4bName == "" {
+			continue
+		}
+
+		var byteOffset int64
+		if ai.duration > 0 {
+			if fi, err := os.Stat(filepath.Join(bookDir, m4bName)); err == nil {
+				byteOffset = int64(item.UserMediaProgress.CurrentTime / ai.duration * float64(fi.Size()))
+			}
+		}
+
+		iPodDir := "/" + hddID + "/Audiobooks/" + strings.ReplaceAll(ai.relPath, string(os.PathSeparator), "/") + "/"
+		bmarkPath := filepath.Join(audiobooksDst, filepath.FromSlash(ai.relPath)+".bmark")
+
+		fmt.Printf("  ABS→iPod  %s (new, %.0fs)\n", ai.relPath, item.UserMediaProgress.CurrentTime)
+		if err := writeBmarks(bmarkPath, []bmark{{
+			ByteOffset: byteOffset,
+			TimeMs:     absMs,
+			Dir:        iPodDir,
+			Filename:   m4bName,
+		}}); err != nil {
+			fmt.Fprintf(os.Stderr, "  create bmark %s: %v\n", ai.relPath, err)
+			continue
+		}
+		stats.Created++
+	}
+
+	return stats, nil
 }
 
 func copyFile(src, dst string, srcInfo os.FileInfo) error {
@@ -324,6 +625,22 @@ func main() {
 		fmt.Fprintf(os.Stderr, "music sync: %v\n", err)
 	}
 
+	var progStats ProgressStats
+	token := os.Getenv("ABS_TOKEN")
+	if token == "" {
+		fmt.Fprintln(os.Stderr, "ABS_TOKEN not set; skipping progress sync")
+	} else {
+		base := absURL
+		if u := os.Getenv("ABS_URL"); u != "" {
+			base = u
+		}
+		fmt.Println("Syncing progress...")
+		progStats, err = syncProgress(base, token, filepath.Join(mountPoint, "Audiobooks"))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "progress sync: %v\n", err)
+		}
+	}
+
 	elapsed := time.Since(start)
 	var dur string
 	if elapsed >= time.Minute {
@@ -333,9 +650,10 @@ func main() {
 	}
 
 	body := fmt.Sprintf(
-		"Audiobooks: %d updated, %d removed (%d files)\nMusic: %d updated, %d removed (%d files)\nCompleted in %s",
+		"Audiobooks: %d updated, %d removed (%d files)\nMusic: %d updated, %d removed (%d files)\nProgress: %d iPod→ABS, %d ABS→iPod, %d created\nCompleted in %s",
 		abStats.Copied, abStats.Deleted, abStats.Total,
 		muStats.Copied, muStats.Deleted, muStats.Total,
+		progStats.IPodToABS, progStats.ABSToIPod, progStats.Created,
 		dur,
 	)
 
