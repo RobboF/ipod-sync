@@ -49,80 +49,57 @@ func findIPod(basePath string) (string, error) {
 	return "", fmt.Errorf("iPod not found in sysfs")
 }
 
-// walkFollowSymlinks walks path following symlinks to directories,
-// guarding against cycles via visited inode tracking.
-func walkFollowSymlinks(root string, fn func(path string, info os.FileInfo) error) error {
-	visited := make(map[uint64]bool)
-	var walk func(string) error
-	walk = func(path string) error {
-		info, err := os.Lstat(path)
-		if err != nil {
-			return nil
-		}
-		// Follow symlinks
-		if info.Mode()&os.ModeSymlink != 0 {
-			target, err := filepath.EvalSymlinks(path)
-			if err != nil {
-				return nil
-			}
-			info, err = os.Stat(target)
-			if err != nil {
-				return nil
-			}
-			path = target
-		}
-		if info.IsDir() {
-			stat, ok := info.Sys().(*syscall.Stat_t)
-			if ok {
-				if visited[stat.Ino] {
-					return nil
-				}
-				visited[stat.Ino] = true
-			}
-		}
-		if err := fn(path, info); err != nil {
-			return err
-		}
-		if info.IsDir() {
-			entries, err := os.ReadDir(path)
-			if err != nil {
-				return nil
-			}
-			for _, e := range entries {
-				if err := walk(filepath.Join(path, e.Name())); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
-	return walk(root)
-}
 
 func findBlockDevice(usbSysPath string) (string, error) {
-	var candidates []string
-	walkFollowSymlinks(usbSysPath, func(path string, info os.FileInfo) error {
-		if !info.IsDir() || info.Name() != "block" {
-			return nil
+	canonical, err := filepath.EvalSymlinks(usbSysPath)
+	if err != nil {
+		return "", err
+	}
+	devs, err := os.ReadDir("/sys/block")
+	if err != nil {
+		return "", err
+	}
+	for _, dev := range devs {
+		if strings.HasPrefix(dev.Name(), "sr") {
+			continue
 		}
-		entries, err := os.ReadDir(path)
+		target, err := filepath.EvalSymlinks(filepath.Join("/sys/block", dev.Name(), "device"))
 		if err != nil {
-			return nil
+			continue
 		}
-		for _, e := range entries {
-			candidates = append(candidates, e.Name())
-		}
-		return nil
-	})
-	for _, name := range candidates {
-		if !strings.HasPrefix(name, "sr") {
-			return name, nil
+		if strings.HasPrefix(target, canonical) {
+			return dev.Name(), nil
 		}
 	}
-	if len(candidates) > 0 {
-		return candidates[0], nil
+	return "", fmt.Errorf("no block device found for %s", usbSysPath)
+}
+
+func findDataPartition(disk string) (string, error) {
+	blockPath := filepath.Join("/sys/block", disk)
+	entries, err := os.ReadDir(blockPath)
+	if err != nil {
+		return "", err
 	}
-	return "", fmt.Errorf("no block device found under %s", usbSysPath)
+	var bestPart string
+	var bestSize int64
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), disk) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(blockPath, e.Name(), "size"))
+		if err != nil {
+			continue
+		}
+		size, _ := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+		if size > bestSize {
+			bestSize = size
+			bestPart = e.Name()
+		}
+	}
+	if bestPart == "" {
+		return "", fmt.Errorf("no partitions found on %s", disk)
+	}
+	return bestPart, nil
 }
 
 // sanitizeName applies FAT-safe renaming: colon → " - ", forbidden chars → "_".
@@ -601,7 +578,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	device := fmt.Sprintf("/dev/%s1", disk)
+	partition, err := findDataPartition(disk)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	device := "/dev/" + partition
 	fmt.Printf("Mounting %s\n", device)
 
 	if err := os.MkdirAll(mountPoint, 0o755); err != nil {
