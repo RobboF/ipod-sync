@@ -50,12 +50,14 @@ func findIPod(basePath string) (string, error) {
 }
 
 
+var sysBlockRoot = "/sys/block"
+
 func findBlockDevice(usbSysPath string) (string, error) {
 	canonical, err := filepath.EvalSymlinks(usbSysPath)
 	if err != nil {
 		return "", err
 	}
-	devs, err := os.ReadDir("/sys/block")
+	devs, err := os.ReadDir(sysBlockRoot)
 	if err != nil {
 		return "", err
 	}
@@ -63,7 +65,7 @@ func findBlockDevice(usbSysPath string) (string, error) {
 		if strings.HasPrefix(dev.Name(), "sr") {
 			continue
 		}
-		target, err := filepath.EvalSymlinks(filepath.Join("/sys/block", dev.Name(), "device"))
+		target, err := filepath.EvalSymlinks(filepath.Join(sysBlockRoot, dev.Name(), "device"))
 		if err != nil {
 			continue
 		}
@@ -75,7 +77,7 @@ func findBlockDevice(usbSysPath string) (string, error) {
 }
 
 func findDataPartition(disk string) (string, error) {
-	blockPath := filepath.Join("/sys/block", disk)
+	blockPath := filepath.Join(sysBlockRoot, disk)
 	entries, err := os.ReadDir(blockPath)
 	if err != nil {
 		return "", err

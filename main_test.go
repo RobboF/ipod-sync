@@ -58,44 +58,6 @@ func TestSanitizeRelPath(t *testing.T) {
 	}
 }
 
-// ---- walkFollowSymlinks ----
-
-func TestWalkFollowSymlinks_FollowsSymlinks(t *testing.T) {
-	target := t.TempDir()
-	os.WriteFile(filepath.Join(target, "file.txt"), []byte("hi"), 0o644)
-
-	root := t.TempDir()
-	os.Symlink(target, filepath.Join(root, "link"))
-
-	var found bool
-	walkFollowSymlinks(root, func(path string, info os.FileInfo) error {
-		if !info.IsDir() && filepath.Base(path) == "file.txt" {
-			found = true
-		}
-		return nil
-	})
-	if !found {
-		t.Error("file.txt not reached through symlink")
-	}
-}
-
-func TestWalkFollowSymlinks_NoCycles(t *testing.T) {
-	root := t.TempDir()
-	sub := filepath.Join(root, "sub")
-	os.Mkdir(sub, 0o755)
-	// symlink back to root — would loop without cycle detection
-	os.Symlink(root, filepath.Join(sub, "cycle"))
-
-	calls := 0
-	walkFollowSymlinks(root, func(_ string, _ os.FileInfo) error {
-		calls++
-		if calls > 100 {
-			t.Fatal("walk did not terminate — likely infinite loop")
-		}
-		return nil
-	})
-}
-
 // ---- copyFile ----
 
 func TestCopyFile(t *testing.T) {
@@ -203,43 +165,113 @@ func TestFindIPod_MultipleDevices(t *testing.T) {
 
 // ---- findBlockDevice ----
 
-func TestFindBlockDevice(t *testing.T) {
-	root := t.TempDir()
-	blockDir := filepath.Join(root, "host0", "target0", "block")
-	os.MkdirAll(filepath.Join(blockDir, "sda"), 0o755)
+func setupSysBlock(t *testing.T) (sysBlock, ipodPath string, restore func()) {
+	t.Helper()
+	sysBlock = t.TempDir()
+	ipodPath = t.TempDir()
+	old := sysBlockRoot
+	sysBlockRoot = sysBlock
+	return sysBlock, ipodPath, func() { sysBlockRoot = old }
+}
 
-	disk, err := findBlockDevice(root)
+func TestFindBlockDevice(t *testing.T) {
+	sysBlock, ipodPath, restore := setupSysBlock(t)
+	defer restore()
+
+	// Target directory under ipodPath (simulates sysfs device path for the iPod)
+	devTarget := filepath.Join(ipodPath, "host0", "target0", "0:0:0:0")
+	os.MkdirAll(devTarget, 0o755)
+
+	// Unrelated disk
+	otherTarget := t.TempDir()
+	sdaDir := filepath.Join(sysBlock, "sda")
+	os.MkdirAll(sdaDir, 0o755)
+	os.Symlink(otherTarget, filepath.Join(sdaDir, "device"))
+
+	// iPod disk
+	sdkDir := filepath.Join(sysBlock, "sdk")
+	os.MkdirAll(sdkDir, 0o755)
+	os.Symlink(devTarget, filepath.Join(sdkDir, "device"))
+
+	disk, err := findBlockDevice(ipodPath)
 	if err != nil {
 		t.Fatalf("findBlockDevice: %v", err)
 	}
-	if disk != "sda" {
-		t.Errorf("disk = %q, want sda", disk)
+	if disk != "sdk" {
+		t.Errorf("disk = %q, want sdk", disk)
 	}
 }
 
-func TestFindBlockDevice_ViaSymlink(t *testing.T) {
-	real := t.TempDir()
-	blockDir := filepath.Join(real, "host0", "block")
-	os.MkdirAll(filepath.Join(blockDir, "sda"), 0o755)
+func TestFindBlockDevice_SkipsOptical(t *testing.T) {
+	sysBlock, ipodPath, restore := setupSysBlock(t)
+	defer restore()
 
-	root := t.TempDir()
-	// Simulate a sysfs symlink: root/device -> real
-	os.Symlink(real, filepath.Join(root, "device"))
+	devTarget := filepath.Join(ipodPath, "host0", "0:0:0:0")
+	os.MkdirAll(devTarget, 0o755)
 
-	disk, err := findBlockDevice(filepath.Join(root, "device"))
+	// Optical LUN (should be skipped)
+	srDir := filepath.Join(sysBlock, "sr0")
+	os.MkdirAll(srDir, 0o755)
+	os.Symlink(devTarget, filepath.Join(srDir, "device"))
+
+	// Disk LUN
+	sdkDir := filepath.Join(sysBlock, "sdk")
+	os.MkdirAll(sdkDir, 0o755)
+	os.Symlink(devTarget, filepath.Join(sdkDir, "device"))
+
+	disk, err := findBlockDevice(ipodPath)
 	if err != nil {
 		t.Fatalf("findBlockDevice: %v", err)
 	}
-	if disk != "sda" {
-		t.Errorf("disk = %q, want sda", disk)
+	if disk != "sdk" {
+		t.Errorf("disk = %q, want sdk (not sr0)", disk)
 	}
 }
 
 func TestFindBlockDevice_NotFound(t *testing.T) {
-	root := t.TempDir()
-	_, err := findBlockDevice(root)
+	_, ipodPath, restore := setupSysBlock(t)
+	defer restore()
+
+	_, err := findBlockDevice(ipodPath)
 	if err == nil {
-		t.Error("expected error when no block dir exists")
+		t.Error("expected error when no matching block device exists")
+	}
+}
+
+// ---- findDataPartition ----
+
+func TestFindDataPartition(t *testing.T) {
+	sysBlock, _, restore := setupSysBlock(t)
+	defer restore()
+
+	diskDir := filepath.Join(sysBlock, "sdk")
+	// Small firmware partition
+	p1 := filepath.Join(diskDir, "sdk1")
+	os.MkdirAll(p1, 0o755)
+	os.WriteFile(filepath.Join(p1, "size"), []byte("1638400\n"), 0o644)
+	// Large data partition
+	p2 := filepath.Join(diskDir, "sdk2")
+	os.MkdirAll(p2, 0o755)
+	os.WriteFile(filepath.Join(p2, "size"), []byte("234567890\n"), 0o644)
+
+	part, err := findDataPartition("sdk")
+	if err != nil {
+		t.Fatalf("findDataPartition: %v", err)
+	}
+	if part != "sdk2" {
+		t.Errorf("partition = %q, want sdk2", part)
+	}
+}
+
+func TestFindDataPartition_NotFound(t *testing.T) {
+	sysBlock, _, restore := setupSysBlock(t)
+	defer restore()
+
+	os.MkdirAll(filepath.Join(sysBlock, "sdk"), 0o755)
+
+	_, err := findDataPartition("sdk")
+	if err == nil {
+		t.Error("expected error when no partitions exist")
 	}
 }
 
